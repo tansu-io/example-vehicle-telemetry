@@ -41,32 +41,6 @@ fn random_plate(rng: &mut impl Rng, age_ids: &[u8]) -> String {
     format!("{}{}{:02} {}{}{}", a1, a2, age, s1, s2, s3)
 }
 
-/// Returns true if the plate conforms to the UK current-style format AA00 AAA.
-fn is_valid_plate(plate: &str) -> bool {
-    let bytes = plate.as_bytes();
-    if bytes.len() != 8 {
-        return false;
-    }
-    // positions 0,1: area letters
-    // position 2,3: age digits
-    // position 4: space
-    // positions 5,6,7: suffix letters
-    let area_ok = AREA_LETTERS.contains(&bytes[0]) && AREA_LETTERS.contains(&bytes[1]);
-    let digits_ok = bytes[2].is_ascii_digit() && bytes[3].is_ascii_digit();
-    let space_ok = bytes[4] == b' ';
-    let suffix_ok = SUFFIX_LETTERS.contains(&bytes[5])
-        && SUFFIX_LETTERS.contains(&bytes[6])
-        && SUFFIX_LETTERS.contains(&bytes[7]);
-
-    if !(area_ok && digits_ok && space_ok && suffix_ok) {
-        return false;
-    }
-
-    let age: u8 = (bytes[2] - b'0') * 10 + (bytes[3] - b'0');
-    let age_ids = valid_age_identifiers();
-    age_ids.contains(&age)
-}
-
 #[derive(Parser)]
 #[command(about = "Generate unique random UK-style vehicle registration plates")]
 struct Args {
@@ -88,7 +62,6 @@ fn main() -> anyhow::Result<()> {
 
     let file = File::create(&args.output)?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "vrm")?;
 
     while seen.len() < args.count {
         let plate = random_plate(&mut rng, &age_ids);
@@ -107,6 +80,32 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+
+    /// Returns true if the plate conforms to the UK current-style format AA00 AAA.
+    fn is_valid_plate(plate: &str) -> bool {
+        let bytes = plate.as_bytes();
+        if bytes.len() != 8 {
+            return false;
+        }
+        // positions 0,1: area letters
+        // position 2,3: age digits
+        // position 4: space
+        // positions 5,6,7: suffix letters
+        let area_ok = AREA_LETTERS.contains(&bytes[0]) && AREA_LETTERS.contains(&bytes[1]);
+        let digits_ok = bytes[2].is_ascii_digit() && bytes[3].is_ascii_digit();
+        let space_ok = bytes[4] == b' ';
+        let suffix_ok = SUFFIX_LETTERS.contains(&bytes[5])
+            && SUFFIX_LETTERS.contains(&bytes[6])
+            && SUFFIX_LETTERS.contains(&bytes[7]);
+
+        if !(area_ok && digits_ok && space_ok && suffix_ok) {
+            return false;
+        }
+
+        let age: u8 = (bytes[2] - b'0') * 10 + (bytes[3] - b'0');
+        let age_ids = valid_age_identifiers();
+        age_ids.contains(&age)
+    }
 
     fn seeded_rng() -> ChaCha8Rng {
         ChaCha8Rng::seed_from_u64(42)
@@ -242,7 +241,7 @@ mod tests {
 
     #[test]
     fn is_valid_plate_rejects_wrong_length() {
-        assert!(!is_valid_plate("AB02ABC"));   // no space, 7 chars
+        assert!(!is_valid_plate("AB02ABC")); // no space, 7 chars
         assert!(!is_valid_plate("AB02 ABCD")); // 9 chars
         assert!(!is_valid_plate(""));
     }

@@ -21,11 +21,11 @@ services:
       - grafana:/var/lib/grafana
     pull_policy: missing
   broker:
-    image: ghcr.io/tansu-io/tansu
+    image: ghcr.io/tansu-io/tansu:latest
     environment:
-      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      ADVERTISED_LISTENER_URL: tcp://broker:9092
       RUST_BACKTRACE: 1
-      RUST_LOG: warn,tansu_sans_io=warn,tansu_model=warn,turso_core=warn
+      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn,turso_core=warn
       STORAGE_ENGINE: "sqlite:///data/tansu.db?vacuum_into=/data/snapshot.db&maintenance_interval=1m"
       OTEL_METRIC_EXPORT_INTERVAL: 5000
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://prometheus:9090/api/v1/otlp/"
@@ -44,6 +44,9 @@ services:
     configs:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
+  kafka39:
+    image: apache/kafka:3.9.2
+    command: /bin/sleep infinity
 configs:
   prometheus_yaml:
     file: etc/prometheus.yaml

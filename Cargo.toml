@@ -9,7 +9,13 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 governor = "0.6"
+human-units = {version = "0.5.3", features = ["iec-units"]}
 humantime = "2"
+opentelemetry = "0.31.0"
+opentelemetry-otlp = "0.31.0"
+opentelemetry-semantic-conventions = "0.31.0"
+opentelemetry-stdout = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["testing"] }
 rand = "0.9"
 rand_chacha = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -17,4 +23,7 @@ serde_json = "1"
 tansu-client = "0.6"
 tansu-sans-io = "0.6"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"

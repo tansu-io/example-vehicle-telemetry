@@ -24,9 +24,9 @@ clean: clean-tansu-db
 topic-create topic *args:
     docker compose exec broker /tansu topic create {{ topic }} {{ args }}
 
-telemetry-topic-create: (topic-create "telemetry" "--config" "cleanup.policy=compact")
+telemetry-topic-create: (topic-create "telemetry" "--config" "cleanup.policy=compact" "--config" "tansu.virtual=true")
 
-plate-generator profile="dev" count="100000":
+plate-generator profile="dev" count="400000":
     target/{{ replace(profile, "dev", "debug") }}/plate_generator --count {{ count }}
 
 create-topics profile="dev":
@@ -50,5 +50,35 @@ logs:
 clean-tansu-db:
     rm -f data/*.db*
 
-docker-prune:
+prune:
     docker system prune --force
+
+ps:
+    docker compose ps
+
+frames:
+    cat broker.log|grep -E "body: \w+(Request|Response)|UnexpectedEof" --only-matching
+
+telemetry-consumer:
+    docker compose exec kafka39 /opt/kafka/bin/kafka-console-consumer.sh \
+        --bootstrap-server broker:9092 \
+        --timeout-ms 15000 \
+        --topic telemetry \
+        --from-beginning \
+        --property print.timestamp=true \
+        --property print.key=true \
+        --property print.offset=true \
+        --property print.partition=true \
+        --property print.value=true
+
+consumer vrm:
+    docker compose exec kafka39 /opt/kafka/bin/kafka-console-consumer.sh \
+        --bootstrap-server broker:9092 \
+        --timeout-ms 15000 \
+        --topic 'telemetry/{{ vrm }}' \
+        --from-beginning \
+        --property print.timestamp=true \
+        --property print.key=true \
+        --property print.offset=true \
+        --property print.partition=true \
+        --property print.value=true

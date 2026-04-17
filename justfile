@@ -1,3 +1,5 @@
+set dotenv-load := true
+
 up: clean-tansu-db docker-compose-up telemetry-topic-create
 
 down: docker-compose-down
@@ -32,8 +34,9 @@ plate-generator profile="dev" count="400000":
 create-topics profile="dev":
     target/{{ replace(profile, "dev", "debug") }}/create_topics
 
-vehicle-simulator profile="dev" duration="10m" interval="1m":
+vehicle-simulator profile="dev" duration="10m" interval="1m": build
     target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }}
+
 
 grafana-ui:
     open http://localhost:3000/

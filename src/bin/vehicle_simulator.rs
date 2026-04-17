@@ -50,6 +50,7 @@ use std::{
 };
 use tansu_client::{Client, ConnectionManager};
 use tansu_sans_io::{
+    ErrorCode,
     produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData},
     record::{Record, deflated, inflated},
 };
@@ -155,25 +156,31 @@ impl Info {
 
 impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
-            self.elapsed().format_duration(),
-            self.records_sent(),
-            self.records_sent_per_second(),
-            self.bandwidth().format_iec(),
-            self.current
-                .latency
-                .min
-                .map(|min| min.format_duration())
-                .expect("minimum"),
-            self.current.latency.mean.expect("mean"),
-            self.current
-                .latency
-                .max
-                .map(|max| max.format_duration())
-                .expect("max")
-        )
+        if let Some(minimum) = self.current.latency.min
+            && let Some(mean) = self.current.latency.mean
+            && let Some(max) = self.current.latency.max
+        {
+            write!(
+                f,
+                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
+                self.elapsed().format_duration(),
+                self.records_sent(),
+                self.records_sent_per_second(),
+                self.bandwidth().format_iec(),
+                minimum.format_duration(),
+                mean,
+                max.format_duration()
+            )
+        } else {
+            write!(
+                f,
+                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s)",
+                self.elapsed().format_duration(),
+                self.records_sent(),
+                self.records_sent_per_second(),
+                self.bandwidth().format_iec(),
+            )
+        }
     }
 }
 
@@ -355,7 +362,12 @@ struct Args {
     input: PathBuf,
 
     /// Kafka broker URL
-    #[arg(short, long, default_value = "tcp://localhost:9092")]
+    #[arg(
+        short,
+        long,
+        env = "ADVERTISED_LISTENER_URL",
+        default_value = "tcp://localhost:9092"
+    )]
     broker: Url,
 
     /// Kafka topic to produce to
@@ -433,10 +445,11 @@ async fn main() -> Result<()> {
     };
 
     println!(
-        "Loaded {} VRMs; simulating for {} at {} per vehicle",
+        "Loaded {} VRMs; simulating for {} at {} per vehicle; broker: {}",
         vrms.len(),
         humantime::format_duration(args.duration),
         humantime::format_duration(args.interval),
+        args.broker,
     );
 
     let pool = ConnectionManager::builder(args.broker.clone())
@@ -578,17 +591,32 @@ async fn main() -> Result<()> {
                     .topic_data(Some(vec![topic_data]));
 
                 let produce_start = SystemTime::now();
-                if let Err(e) = client.call(req).await.inspect(|_| {
-                    PRODUCE_RECORD_COUNT.add(1u64, &attributes);
-                    PRODUCE_API_DURATION.record(
-                        produce_start
-                            .elapsed()
-                            .inspect(|duration| debug!(produce_duration_ms = duration.as_millis()))
-                            .map_or(0, |duration| duration.as_millis() as u64),
-                        &attributes,
-                    );
-                }) {
-                    eprintln!("Produce error for {vrm}: {e}");
+
+                match client.call(req).await {
+                    Err(e) => {
+                        eprintln!("Produce error for {vrm}: {e}");
+                    }
+
+                    Ok(response) => {
+                        for topic in response.responses.as_deref().unwrap_or_default() {
+                            for partition in
+                                topic.partition_responses.as_deref().unwrap_or_default()
+                            {
+                                assert_eq!(i16::from(ErrorCode::None), partition.error_code);
+                            }
+                        }
+
+                        PRODUCE_RECORD_COUNT.add(1u64, &attributes);
+                        PRODUCE_API_DURATION.record(
+                            produce_start
+                                .elapsed()
+                                .inspect(|duration| {
+                                    debug!(produce_duration_ms = duration.as_millis())
+                                })
+                                .map_or(0, |duration| duration.as_millis() as u64),
+                            &attributes,
+                        );
+                    }
                 }
             }
         });

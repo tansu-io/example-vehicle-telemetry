@@ -28,15 +28,14 @@ topic-create topic *args:
 
 telemetry-topic-create: (topic-create "telemetry" "--config" "cleanup.policy=compact" "--config" "tansu.virtual=true")
 
-plate-generator profile="dev" count="400000":
+plate-generator count="400000" profile="dev":
     target/{{ replace(profile, "dev", "debug") }}/plate_generator --count {{ count }}
 
 create-topics profile="dev":
     target/{{ replace(profile, "dev", "debug") }}/create_topics
 
-vehicle-simulator profile="dev" duration="10m" interval="1m": build
+vehicle-simulator duration="10m" interval="1m" profile="dev": build
     target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }}
-
 
 grafana-ui:
     open http://localhost:3000/

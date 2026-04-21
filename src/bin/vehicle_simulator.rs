@@ -158,18 +158,22 @@ impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(minimum) = self.current.latency.min
             && let Some(mean) = self.current.latency.mean
+            && let Some(p99) = self.current.latency.p99
+            && let Some(p99_9) = self.current.latency.p99_9
             && let Some(max) = self.current.latency.max
         {
             write!(
                 f,
-                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
+                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), min: {}, mean: {:.1}ms, p99: {}, p99.9: {}, max: {}",
                 self.elapsed().format_duration(),
                 self.records_sent(),
                 self.records_sent_per_second(),
                 self.bandwidth().format_iec(),
                 minimum.format_duration(),
                 mean,
-                max.format_duration()
+                p99.format_duration(),
+                p99_9.format_duration(),
+                max.format_duration(),
             )
         } else {
             write!(
@@ -189,6 +193,62 @@ struct Latency {
     min: Option<Duration>,
     max: Option<Duration>,
     mean: Option<f64>,
+    p99: Option<Duration>,
+    p99_9: Option<Duration>,
+}
+
+/// Core percentile calculation from explicit-bucket histogram data.
+///
+/// `bounds` has N entries; `counts` has N+1 entries (last bucket is the overflow).
+/// Returns `None` when there are no observations.
+fn percentile_from_buckets(bounds: &[f64], counts: &[u64], p: f64) -> Option<Duration> {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+
+    let target = ((total as f64 * p).ceil() as u64).max(1);
+    let mut cumulative = 0u64;
+
+    for (i, &count) in counts.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= target {
+            let lower = if i == 0 { 0.0f64 } else { bounds[i - 1] };
+            let upper = if i < bounds.len() {
+                bounds[i]
+            } else {
+                bounds.last().copied().unwrap_or(lower) * 2.0
+            };
+            let rank_in_bucket = target - (cumulative - count);
+            let frac = if count > 0 {
+                rank_in_bucket as f64 / count as f64
+            } else {
+                0.5
+            };
+            return Some(Duration::from_millis(
+                (lower + frac * (upper - lower)) as u64,
+            ));
+        }
+    }
+
+    None
+}
+
+fn histogram_percentile(histogram: &Histogram<u64>, p: f64) -> Option<Duration> {
+    let first = histogram.data_points().next()?;
+    let bounds: Vec<f64> = first.bounds().collect();
+    let n_buckets = bounds.len() + 1;
+
+    let mut agg_counts = vec![0u64; n_buckets];
+    for dp in histogram.data_points() {
+        for (i, c) in dp.bucket_counts().enumerate() {
+            if i < n_buckets {
+                agg_counts[i] += c;
+            }
+        }
+    }
+
+    percentile_from_buckets(&bounds, &agg_counts, p)
 }
 
 impl From<&Histogram<u64>> for Latency {
@@ -209,8 +269,16 @@ impl From<&Histogram<u64>> for Latency {
         let count = histogram.data_points().map(|dp| dp.count()).sum::<u64>() as f64;
 
         let mean = Some(sum / count);
+        let p99 = histogram_percentile(histogram, 0.99);
+        let p99_9 = histogram_percentile(histogram, 0.999);
 
-        Self { min, max, mean }
+        Self {
+            min,
+            max,
+            mean,
+            p99,
+            p99_9,
+        }
     }
 }
 
@@ -673,4 +741,125 @@ async fn main() -> Result<()> {
 
     println!("Simulation complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // OTel default explicit bucket boundaries (ms scale matches our histogram unit).
+    // 13 bounds → 14 buckets (last is overflow).
+    const DEFAULT_BOUNDS: &[f64] = &[
+        0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0,
+    ];
+
+    fn counts_uniform(n: u64) -> Vec<u64> {
+        // Spread n observations evenly across the first 10 buckets (0–1000 ms).
+        let buckets = 10usize;
+        let per = n / buckets as u64;
+        let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        for i in 0..buckets {
+            counts[i] = per;
+        }
+        counts
+    }
+
+    #[test]
+    fn empty_histogram_returns_none() {
+        let counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        assert_eq!(percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99), None);
+        assert_eq!(
+            percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999),
+            None
+        );
+    }
+
+    #[test]
+    fn single_observation_in_first_bucket() {
+        // One observation in bucket [0, 5). p99 and p99.9 should both land there.
+        let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        counts[0] = 1;
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        assert!(p99 < Duration::from_millis(5), "p99={p99:?}");
+        assert!(p99_9 < Duration::from_millis(5), "p99.9={p99_9:?}");
+    }
+
+    #[test]
+    fn all_in_one_bucket_interpolates_within_bounds() {
+        // 1000 observations in bucket [100, 250) — all percentiles must lie in [100, 250).
+        let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        // bucket index 7 spans [100, 250)
+        counts[7] = 1000;
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        assert!(
+            p99 >= Duration::from_millis(100) && p99 < Duration::from_millis(250),
+            "p99={p99:?}"
+        );
+        assert!(
+            p99_9 >= Duration::from_millis(100) && p99_9 < Duration::from_millis(250),
+            "p99.9={p99_9:?}"
+        );
+        assert!(p99_9 >= p99, "p99.9 should be >= p99");
+    }
+
+    #[test]
+    fn p99_interpolates_correctly_uniform_distribution() {
+        // 1000 observations, 100 per bucket across buckets 0–9.
+        // p99 = rank 990; buckets 0–8 hold 900, so rank 990 lands in bucket 9 [500, 750).
+        // rank_in_bucket = 990 - 900 = 90, frac = 90/100 = 0.9
+        // value = 500 + 0.9 * (750 - 500) = 500 + 225 = 725 ms
+        let counts = counts_uniform(1000);
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        assert_eq!(p99, Duration::from_millis(725), "p99={p99:?}");
+    }
+
+    #[test]
+    fn p99_9_interpolates_correctly_uniform_distribution() {
+        // p99.9 = rank ceil(1000 * 0.999) = 999; same bucket 9 [500, 750).
+        // rank_in_bucket = 999 - 900 = 99, frac = 99/100 = 0.99
+        // value = 500 + 0.99 * 250 = 500 + 247.5 → truncated to 747 ms
+        let counts = counts_uniform(1000);
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        assert_eq!(p99_9, Duration::from_millis(747), "p99.9={p99_9:?}");
+    }
+
+    #[test]
+    fn p99_9_greater_than_or_equal_to_p99() {
+        let counts = counts_uniform(10_000);
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        assert!(p99_9 >= p99, "p99.9={p99_9:?} p99={p99:?}");
+    }
+
+    #[test]
+    fn overflow_bucket_uses_doubled_upper_bound() {
+        // All observations in the overflow bucket (> 5000 ms).
+        // Upper bound is 5000 * 2 = 10000, lower is 5000.
+        let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        *counts.last_mut().unwrap() = 100;
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        assert!(p99 >= Duration::from_millis(5000), "p99={p99:?}");
+        assert!(p99 <= Duration::from_millis(10000), "p99={p99:?}");
+    }
+
+    #[test]
+    fn p99_exact_boundary_one_percent_in_last_bucket() {
+        // 99 observations in bucket 0 [0,5), 1 in bucket 1 [5,10).
+        // p99 = rank 99 → still in bucket 0; p99.9 = rank 100 → in bucket 1.
+        let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
+        counts[0] = 99;
+        counts[1] = 1;
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        assert!(
+            p99 < Duration::from_millis(5),
+            "p99={p99:?} expected in [0, 5)"
+        );
+        assert!(
+            p99_9 >= Duration::from_millis(5) && p99_9 < Duration::from_millis(10),
+            "p99.9={p99_9:?} expected in [5, 10)"
+        );
+    }
 }

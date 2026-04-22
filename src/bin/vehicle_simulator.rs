@@ -896,13 +896,15 @@ mod tests {
 
     #[test]
     fn overflow_bucket_uses_doubled_upper_bound() {
-        // All observations in the overflow bucket (> 5000 ms).
-        // Upper bound is 5000 * 2 = 10000, lower is 5000.
+        // All observations in the overflow bucket (> last μs).
+        // Upper bound is last * 2, lower is last.
+
+        let last = DEFAULT_BOUNDS.last().map(|last| *last as u64).unwrap();
         let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
         *counts.last_mut().unwrap() = 100;
         let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
-        assert!(p99 >= Duration::from_micros(5000), "p99={p99:?}");
-        assert!(p99 <= Duration::from_micros(10000), "p99={p99:?}");
+        assert!(p99 >= Duration::from_micros(last), "p99={p99:?}");
+        assert!(p99 <= Duration::from_micros(last * 2), "p99={p99:?}");
     }
 
     #[test]

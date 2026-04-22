@@ -39,6 +39,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     fmt::{self, Display},
     fs::File,
     io::BufReader,
@@ -61,7 +62,17 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument};
+use tracing_subscriber::{
+    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use url::Url;
+
+// OTel default explicit bucket boundaries (scale matches our histogram unit).
+// 13 bounds → 14 buckets (last is overflow).
+const DEFAULT_BOUNDS: &[f64] = &[
+    0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0,
+    10000.0,
+];
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     global::meter_with_scope(
@@ -83,8 +94,9 @@ static PRODUCE_API_DURATION: LazyLock<opentelemetry::metrics::Histogram<u64>> =
     LazyLock::new(|| {
         METER
             .u64_histogram("produce_duration")
+            .with_boundaries(DEFAULT_BOUNDS.into())
             .with_unit("ms")
-            .with_description("Produce API latencies in milliseconds")
+            .with_description("Produce API latencies in microsecond")
             .build()
     });
 
@@ -95,7 +107,7 @@ pub enum CancelKind {
     Timeout,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 struct Info {
     started_at: SystemTime,
     previous: Option<ObservationLatency>,
@@ -121,6 +133,7 @@ impl Info {
             .taken_at
             .duration_since(
                 self.previous
+                    .as_ref()
                     .map_or(self.started_at, |previous| previous.observation.taken_at),
             )
             .expect("duration")
@@ -130,6 +143,7 @@ impl Info {
         self.current.observation.bytes_sent
             - self
                 .previous
+                .as_ref()
                 .map(|previous| previous.observation.bytes_sent)
                 .unwrap_or_default()
     }
@@ -138,6 +152,7 @@ impl Info {
         self.current.observation.record_count
             - self
                 .previous
+                .as_ref()
                 .map(|previous| previous.observation.record_count)
                 .unwrap_or_default()
     }
@@ -158,21 +173,26 @@ impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(minimum) = self.current.latency.min
             && let Some(mean) = self.current.latency.mean
-            && let Some(p99) = self.current.latency.p99
-            && let Some(p99_9) = self.current.latency.p99_9
             && let Some(max) = self.current.latency.max
         {
             write!(
                 f,
-                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), min: {}, mean: {:.1}ms, p99: {}, p99.9: {}, max: {}",
+                "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), min: {}, mean: {}, {}, max: {}",
                 self.elapsed().format_duration(),
                 self.records_sent(),
                 self.records_sent_per_second(),
                 self.bandwidth().format_iec(),
                 minimum.format_duration(),
-                mean,
-                p99.format_duration(),
-                p99_9.format_duration(),
+                mean.format_duration(),
+                self.current
+                    .latency
+                    .percentiles
+                    .iter()
+                    .map(|(percentile, duration)| {
+                        format!("{percentile}: {}", duration.format_duration())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 max.format_duration(),
             )
         } else {
@@ -188,20 +208,41 @@ impl Display for Info {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, PartialEq, PartialOrd)]
 struct Latency {
     min: Option<Duration>,
     max: Option<Duration>,
-    mean: Option<f64>,
-    p99: Option<Duration>,
-    p99_9: Option<Duration>,
+    mean: Option<Duration>,
+
+    percentiles: BTreeMap<Percentile, Duration>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum Percentile {
+    TwoNines,
+    ThreeNines,
+}
+
+impl Display for Percentile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} %ile", self.as_ref() * 100.0)
+    }
+}
+
+impl AsRef<f64> for Percentile {
+    fn as_ref(&self) -> &f64 {
+        match self {
+            Percentile::TwoNines => &0.99,
+            Percentile::ThreeNines => &0.999,
+        }
+    }
 }
 
 /// Core percentile calculation from explicit-bucket histogram data.
 ///
 /// `bounds` has N entries; `counts` has N+1 entries (last bucket is the overflow).
 /// Returns `None` when there are no observations.
-fn percentile_from_buckets(bounds: &[f64], counts: &[u64], p: f64) -> Option<Duration> {
+fn percentile_from_buckets(bounds: &[f64], counts: &[u64], p: &f64) -> Option<Duration> {
     let total: u64 = counts.iter().sum();
     if total == 0 {
         return None;
@@ -225,7 +266,7 @@ fn percentile_from_buckets(bounds: &[f64], counts: &[u64], p: f64) -> Option<Dur
             } else {
                 0.5
             };
-            return Some(Duration::from_millis(
+            return Some(Duration::from_micros(
                 (lower + frac * (upper - lower)) as u64,
             ));
         }
@@ -234,7 +275,7 @@ fn percentile_from_buckets(bounds: &[f64], counts: &[u64], p: f64) -> Option<Dur
     None
 }
 
-fn histogram_percentile(histogram: &Histogram<u64>, p: f64) -> Option<Duration> {
+fn histogram_percentile(histogram: &Histogram<u64>, p: &f64) -> Option<Duration> {
     let first = histogram.data_points().next()?;
     let bounds: Vec<f64> = first.bounds().collect();
     let n_buckets = bounds.len() + 1;
@@ -248,7 +289,7 @@ fn histogram_percentile(histogram: &Histogram<u64>, p: f64) -> Option<Duration> 
         }
     }
 
-    percentile_from_buckets(&bounds, &agg_counts, p)
+    percentile_from_buckets(&bounds, &agg_counts, &p)
 }
 
 impl From<&Histogram<u64>> for Latency {
@@ -257,32 +298,43 @@ impl From<&Histogram<u64>> for Latency {
             .data_points()
             .filter_map(|dp| dp.min())
             .min()
-            .map(Duration::from_millis);
+            .map(Duration::from_micros)
+            .inspect(|min| debug!(min = %min.format_duration()));
 
         let max = histogram
             .data_points()
             .filter_map(|dp| dp.max())
             .max()
-            .map(Duration::from_millis);
+            .map(Duration::from_micros)
+            .inspect(|max| debug!(max = %max.format_duration()));
 
         let sum = histogram.data_points().map(|dp| dp.sum()).sum::<u64>() as f64;
         let count = histogram.data_points().map(|dp| dp.count()).sum::<u64>() as f64;
 
-        let mean = Some(sum / count);
-        let p99 = histogram_percentile(histogram, 0.99);
-        let p99_9 = histogram_percentile(histogram, 0.999);
+        debug!(sum, count);
+
+        let mean = Some(Duration::from_micros((sum / count) as u64))
+            .inspect(|mean| debug!(mean = %mean.format_duration()));
+
+        let percentiles = [Percentile::TwoNines, Percentile::ThreeNines]
+            .into_iter()
+            .filter_map(|percentile| {
+                histogram_percentile(histogram, percentile.as_ref())
+                    .map(|duration| (percentile, duration))
+                    .inspect(|(percentile, duration)|debug!(%percentile, duration = %duration.format_duration()))
+            })
+            .collect();
 
         Self {
             min,
             max,
             mean,
-            p99,
-            p99_9,
+            percentiles,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, PartialEq, PartialOrd)]
 struct ObservationLatency {
     observation: Observation,
     latency: Latency,
@@ -365,7 +417,7 @@ impl MetricExporter {
                 info.current.latency = Latency::from(histogram);
             }
 
-            _ => (),
+            (scope, metric, _) => debug!(scope, metric),
         }
     }
 }
@@ -375,9 +427,9 @@ impl PushMetricExporter for MetricExporter {
         let cancelled = self.cancellation.is_cancelled();
 
         if cancelled {
-            if let Some(previous) = *self.previous.lock().expect("previous") {
+            if let Some(ref previous) = *self.previous.lock().expect("previous") {
                 let mut info = Info::new(self.started_at);
-                info.current = previous;
+                info.current = previous.clone();
 
                 println!("{}", info);
             }
@@ -423,9 +475,9 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
 }
 
 #[derive(Parser)]
-#[command(about = "Simulate vehicle telemetry by producing GPS updates to Kafka")]
+#[command(about = "Simulate vehicle plates by producing GPS updates to Kafka")]
 struct Args {
-    /// CSV file containing VRM plates (one per line)
+    /// CSV file containing vehicle plates (one per line)
     #[arg(short, long, default_value = "vrm.csv")]
     input: PathBuf,
 
@@ -481,7 +533,19 @@ impl Telemetry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_level(true)
+                .with_line_number(true)
+                .with_thread_ids(false)
+                .with_span_events(FmtSpan::FULL),
+        )
+        .init();
+
     let token = CancellationToken::new();
+    debug!(?token);
 
     let meter_provider = {
         let exporter = MetricExporter::new(token.clone());
@@ -501,8 +565,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Read every VRM from the CSV (no header row).
-    let vrms: Vec<String> = {
+    // Read every plate from the CSV (no header row).
+    let plates: Vec<String> = {
         let file = File::open(&args.input).with_context(|| format!("opening {:?}", args.input))?;
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
@@ -513,8 +577,8 @@ async fn main() -> Result<()> {
     };
 
     println!(
-        "Loaded {} VRMs; simulating for {} at {} per vehicle; broker: {}",
-        vrms.len(),
+        "Loaded {} vehicles; simulating for {} at {} per vehicle; broker: {}",
+        plates.len(),
         humantime::format_duration(args.duration),
         humantime::format_duration(args.interval),
         args.broker,
@@ -535,13 +599,13 @@ async fn main() -> Result<()> {
 
     let interval = args.interval;
     let topic = Arc::new(args.topic.clone());
-    let n = vrms.len();
+    let n = plates.len();
 
     let mut set = JoinSet::new();
 
     let mut seed_rng = rand::rng();
 
-    for (i, vrm) in vrms.into_iter().enumerate() {
+    for (i, plate) in plates.into_iter().enumerate() {
         let client = client.clone();
         let limiter = limiter.clone();
         let topic = topic.clone();
@@ -559,7 +623,7 @@ async fn main() -> Result<()> {
         };
 
         set.spawn(async move {
-            let attributes = [KeyValue::new("vrm", vrm.clone())];
+            let attributes = [KeyValue::new("plate", plate.clone())];
 
             let clock = QuantaClock::default();
             let mut rng = SmallRng::seed_from_u64(rng_seed);
@@ -577,7 +641,7 @@ async fn main() -> Result<()> {
             loop {
                 // Wait until the governor allows this key.
                 loop {
-                    match limiter.check_key(&vrm) {
+                    match limiter.check_key(&plate) {
                         Ok(_) => break,
                         Err(not_until) => {
                             let wait = not_until.wait_time_from(clock.now());
@@ -603,13 +667,13 @@ async fn main() -> Result<()> {
                 let value = match serde_json::to_string(&state) {
                     Ok(j) => j,
                     Err(e) => {
-                        eprintln!("JSON serialisation error for {vrm}: {e}");
+                        eprintln!("JSON serialisation error for {plate}: {e}");
                         continue;
                     }
                 };
 
                 let record = Record::builder()
-                    .key(Some(Bytes::from(format!(r#""{vrm}""#))))
+                    .key(Some(Bytes::from(format!(r#""{plate}""#))))
                     .value(Some(Bytes::from(value)));
 
                 let batch = match inflated::Batch::builder()
@@ -628,7 +692,7 @@ async fn main() -> Result<()> {
                 {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("Batch build error for {vrm}: {e}");
+                        eprintln!("Batch build error for {plate}: {e}");
                         continue;
                     }
                 };
@@ -636,7 +700,7 @@ async fn main() -> Result<()> {
                 let deflated_batch = match deflated::Batch::try_from(batch) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("Deflate error for {vrm}: {e}");
+                        eprintln!("Deflate error for {plate}: {e}");
                         continue;
                     }
                 };
@@ -662,7 +726,7 @@ async fn main() -> Result<()> {
 
                 match client.call(req).await {
                     Err(e) => {
-                        eprintln!("Produce error for {vrm}: {e}");
+                        eprintln!("Produce error for {plate}: {e}");
                     }
 
                     Ok(response) => {
@@ -679,9 +743,9 @@ async fn main() -> Result<()> {
                             produce_start
                                 .elapsed()
                                 .inspect(|duration| {
-                                    debug!(produce_duration_ms = duration.as_millis())
+                                    debug!(plate, produce_duration = duration.as_micros() as u64)
                                 })
-                                .map_or(0, |duration| duration.as_millis() as u64),
+                                .map_or(0, |duration| duration.as_micros() as u64),
                             &attributes,
                         );
                     }
@@ -747,12 +811,6 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    // OTel default explicit bucket boundaries (ms scale matches our histogram unit).
-    // 13 bounds → 14 buckets (last is overflow).
-    const DEFAULT_BOUNDS: &[f64] = &[
-        0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0,
-    ];
-
     fn counts_uniform(n: u64) -> Vec<u64> {
         // Spread n observations evenly across the first 10 buckets (0–1000 ms).
         let buckets = 10usize;
@@ -767,9 +825,12 @@ mod tests {
     #[test]
     fn empty_histogram_returns_none() {
         let counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
-        assert_eq!(percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99), None);
         assert_eq!(
-            percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999),
+            percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99),
+            None
+        );
+        assert_eq!(
+            percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999),
             None
         );
     }
@@ -779,10 +840,10 @@ mod tests {
         // One observation in bucket [0, 5). p99 and p99.9 should both land there.
         let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
         counts[0] = 1;
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
-        assert!(p99 < Duration::from_millis(5), "p99={p99:?}");
-        assert!(p99_9 < Duration::from_millis(5), "p99.9={p99_9:?}");
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999).unwrap();
+        assert!(p99 < Duration::from_micros(5), "p99={p99:?}");
+        assert!(p99_9 < Duration::from_micros(5), "p99.9={p99_9:?}");
     }
 
     #[test]
@@ -791,14 +852,14 @@ mod tests {
         let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
         // bucket index 7 spans [100, 250)
         counts[7] = 1000;
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999).unwrap();
         assert!(
-            p99 >= Duration::from_millis(100) && p99 < Duration::from_millis(250),
+            p99 >= Duration::from_micros(100) && p99 < Duration::from_micros(250),
             "p99={p99:?}"
         );
         assert!(
-            p99_9 >= Duration::from_millis(100) && p99_9 < Duration::from_millis(250),
+            p99_9 >= Duration::from_micros(100) && p99_9 < Duration::from_micros(250),
             "p99.9={p99_9:?}"
         );
         assert!(p99_9 >= p99, "p99.9 should be >= p99");
@@ -811,8 +872,8 @@ mod tests {
         // rank_in_bucket = 990 - 900 = 90, frac = 90/100 = 0.9
         // value = 500 + 0.9 * (750 - 500) = 500 + 225 = 725 ms
         let counts = counts_uniform(1000);
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        assert_eq!(p99, Duration::from_millis(725), "p99={p99:?}");
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        assert_eq!(p99, Duration::from_micros(725), "p99={p99:?}");
     }
 
     #[test]
@@ -821,15 +882,15 @@ mod tests {
         // rank_in_bucket = 999 - 900 = 99, frac = 99/100 = 0.99
         // value = 500 + 0.99 * 250 = 500 + 247.5 → truncated to 747 ms
         let counts = counts_uniform(1000);
-        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
-        assert_eq!(p99_9, Duration::from_millis(747), "p99.9={p99_9:?}");
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999).unwrap();
+        assert_eq!(p99_9, Duration::from_micros(747), "p99.9={p99_9:?}");
     }
 
     #[test]
     fn p99_9_greater_than_or_equal_to_p99() {
         let counts = counts_uniform(10_000);
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999).unwrap();
         assert!(p99_9 >= p99, "p99.9={p99_9:?} p99={p99:?}");
     }
 
@@ -839,9 +900,9 @@ mod tests {
         // Upper bound is 5000 * 2 = 10000, lower is 5000.
         let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
         *counts.last_mut().unwrap() = 100;
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        assert!(p99 >= Duration::from_millis(5000), "p99={p99:?}");
-        assert!(p99 <= Duration::from_millis(10000), "p99={p99:?}");
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        assert!(p99 >= Duration::from_micros(5000), "p99={p99:?}");
+        assert!(p99 <= Duration::from_micros(10000), "p99={p99:?}");
     }
 
     #[test]
@@ -851,14 +912,14 @@ mod tests {
         let mut counts = vec![0u64; DEFAULT_BOUNDS.len() + 1];
         counts[0] = 99;
         counts[1] = 1;
-        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.99).unwrap();
-        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, 0.999).unwrap();
+        let p99 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.99).unwrap();
+        let p99_9 = percentile_from_buckets(DEFAULT_BOUNDS, &counts, &0.999).unwrap();
         assert!(
-            p99 < Duration::from_millis(5),
+            p99 < Duration::from_micros(5),
             "p99={p99:?} expected in [0, 5)"
         );
         assert!(
-            p99_9 >= Duration::from_millis(5) && p99_9 < Duration::from_millis(10),
+            p99_9 >= Duration::from_micros(5) && p99_9 < Duration::from_micros(10),
             "p99.9={p99_9:?} expected in [5, 10)"
         );
     }

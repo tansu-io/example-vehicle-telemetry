@@ -35,7 +35,7 @@ create-topics profile="dev":
     target/{{ replace(profile, "dev", "debug") }}/create_topics
 
 vehicle-simulator duration="10m" interval="1m" profile="dev": build
-    target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }}
+    target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }} | tee simulator.log
 
 grafana-ui:
     open http://localhost:3000/

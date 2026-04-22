@@ -34,8 +34,8 @@ plate-generator count="400000" profile="dev":
 create-topics profile="dev":
     target/{{ replace(profile, "dev", "debug") }}/create_topics
 
-vehicle-simulator duration="10m" interval="1m" profile="dev": build
-    target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }} | tee simulator.log
+vehicle-simulator duration="10m" interval="1m" broker="tcp://localhost:9092" profile="dev": build
+    target/{{ replace(profile, "dev", "debug") }}/vehicle_simulator --duration {{ duration }} --interval {{ interval }} --broker {{ broker }} | tee simulator.log
 
 grafana-ui:
     open http://localhost:3000/
